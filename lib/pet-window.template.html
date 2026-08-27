@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>dsh-pet</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: transparent; overflow: hidden; width: 100%; height: 100%; }
+  body { user-select: none; -webkit-user-select: none; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  #pet { position: absolute; left: 24px; top: 78px; cursor: grab; transform-origin: left top; pointer-events: auto; }
+  #pet.grabbing { cursor: grabbing; }
+  body.dsh-pet-dragging { cursor: grabbing; }
+  #sprite { background-repeat: no-repeat; image-rendering: pixelated; position: absolute; left: 0; bottom: 0; }
+  #bubble { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.97); color: #333; border: 1px solid #d0d0d0; border-radius: 10px; padding: 10px 18px; font-size: 16px; line-height: 1.5; max-width: 380px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; box-shadow: 0 3px 14px rgba(0,0,0,0.2); display: none; pointer-events: auto; }
+  #bubble::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: rgba(255,255,255,0.97); }
+</style>
+</head>
+<body>
+<div id="pet">
+  <div id="bubble"></div>
+  <div id="sprite"></div>
+</div>
+<script>
+// ── dsh-pet 全局宠物窗口（经 pet-preload.js 的 petBridge 与 Host 通信） ──
+var SPRITE_B64 = "__SPRITE_B64__";
+var ANIM_ROW = { idle: 0, run_r: 1, run_l: 2, wave: 3, jump: 4, failed: 5, waiting: 6, running: 7, review: 8, writing: 7 };
+var FRAMES = 8, ROWS = 9, FPS = 8, BUBBLE_MS = 3500;
+// 每行动画的有效帧数（跳过精灵图行末尾的空白帧，避免闪现）。
+// 依据逐帧像素分析：default(Omen Kitty) 部分行末尾有空白帧；claude 图每格都有内容。
+var SKIN_ANIM_FRAMES = {
+  default: { idle: 6, run_r: 8, run_l: 8, wave: 4, jump: 5, failed: 8, waiting: 6, running: 6, review: 6, writing: 6 },
+  claude: { idle: 8, run_r: 8, run_l: 8, wave: 8, jump: 8, failed: 8, waiting: 8, running: 8, review: 8, writing: 8 },
+};
+function animFrames() {
+  var m = SKIN_ANIM_FRAMES[state.skin] || SKIN_ANIM_FRAMES['default'];
+  return m;
+}
+var BUBBLE_ZONE = 130; // 顶部气泡预留区（px，容纳 16px 字气泡）
+var MIN_WIN_W = 400;   // 窗口最小宽度（px），保证气泡文字不被窗口横向裁剪
+var PAD = 24;         // 四周拖动边距（px），窗口透明但可按住拖动
+
+var pet = document.getElementById('pet');
+var sprite = document.getElementById('sprite');
+var bubble = document.getElementById('bubble');
+
+var state = { state: 'idle', message: '', ts: 0, enabled: true, skin: 'default', scale: 1, skins: [] };
+var view = { anim: 'idle', frame: 0, dragAnim: null };
+var imgW = 0, imgH = 0, loaded = false;
+var lastTs = -1, lastSkin = '', lastScale = -1;
+var objUrl = null, bubbleTimer = null, animTimer = 0;
+var alive = true;
+
+var bridge = window.petBridge || {
+  onState: function () {}, onSkin: function () {}, click: function () {},
+  action: function () {}, requestSkin: function () {}, dragging: function () {},
+  draggingMove: function () {},
+};
+
+// ── 尺寸 ──
+function sizeSprite() {
+  var fw = imgW / FRAMES, fh = imgH / ROWS;
+  sprite.style.width = fw + 'px';
+  sprite.style.height = fh + 'px';
+  pet.style.width = fw + 'px';
+  pet.style.height = fh + 'px';
+  pet.style.transform = 'scale(' + (state.scale || 1) + ')';
+  // 窗口宽度至少 MIN_WIN_W，保证气泡文字完整显示（不因宠物小而被横向裁剪）
+  var winW = Math.round(fw * (state.scale || 1)) + PAD * 2;
+  if (winW < MIN_WIN_W) winW = MIN_WIN_W;
+  // 通知 Host 调整窗口尺寸（窗口 = 帧尺寸×scale + 四周拖动边距 + 顶部气泡区）
+  if (bridge) bridge.action({
+    type: 'set-size',
+    width: winW,
+    height: Math.round(fh * (state.scale || 1)) + BUBBLE_ZONE + PAD,
+  });
+}
+
+// ── 精灵图 ──
+var img = new Image();
+img.onload = function () {
+  imgW = img.naturalWidth; imgH = img.naturalHeight; loaded = true;
+  sprite.style.backgroundImage = 'url("' + img.src + '")';
+  sizeSprite();
+};
+img.src = 'data:image/webp;base64,' + SPRITE_B64;
+
+// 皮肤：向 Host 请求 base64
+function applySkin() {
+  lastSkin = state.skin;
+  if (state.skin === 'default' || state.skin === '') {
+    if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
+    sprite.style.backgroundImage = 'url("data:image/webp;base64,' + SPRITE_B64 + '")';
+    if (loaded) sizeSprite();
+    return;
+  }
+  if (bridge) bridge.requestSkin(state.skin);
+}
+bridge.onSkin(function (payload) {
+  if (!payload || !payload.name || payload.name !== state.skin) return;
+  if (payload.b64) {
+    if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
+    objUrl = URL.createObjectURL(new Blob([Uint8Array.from(atob(payload.b64), function (c) { return c.charCodeAt(0); })], { type: 'image/webp' }));
+    var si = new Image();
+    si.onload = function () {
+      imgW = si.naturalWidth; imgH = si.naturalHeight; loaded = true;
+      sprite.style.backgroundImage = 'url("' + objUrl + '")';
+      sizeSprite();
+    };
+    si.src = objUrl;
+  } else {
+    applySkin(); // 加载失败回默认
+  }
+});
+
+// ── 动画 ──
+function step() {
+  if (!alive || !loaded) return;
+  var anim = view.dragAnim || view.anim;
+  var row = ANIM_ROW[anim] !== undefined ? ANIM_ROW[anim] : 0;
+  var fw = imgW / FRAMES, fh = imgH / ROWS;
+  // 只用该行动画的有效帧数循环，跳过行末尾的空白帧（避免闪现）
+  var nf = animFrames()[anim] || FRAMES;
+  sprite.style.backgroundSize = imgW + 'px ' + imgH + 'px';
+  sprite.style.backgroundPosition = (-(view.frame * fw)).toFixed(1) + 'px ' + (-(row * fh)).toFixed(1) + 'px';
+  view.frame = (view.frame + 1) % nf;
+  if (view.frame === 0 && (anim === 'wave' || anim === 'jump')) view.anim = 'idle';
+}
+animTimer = window.setInterval(step, Math.round(1000 / FPS));
+
+// ── 气泡 ──
+function showBubble(text, anim) {
+  if (!text) { bubble.style.display = 'none'; bubble.textContent = ''; return; }
+  bubble.textContent = text;
+  bubble.style.display = 'block';
+  if (bubbleTimer !== null) window.clearTimeout(bubbleTimer);
+  bubbleTimer = null;
+  // 工作类状态（等待审批/工作中/写入/查阅）气泡常驻保持提示；其余（完成/出错等）几秒后消失
+  var persistent = anim === 'waiting' || anim === 'running' || anim === 'writing' || anim === 'review';
+  if (!persistent) bubbleTimer = window.setTimeout(function () { bubble.style.display = 'none'; }, BUBBLE_MS);
+}
+
+// ── 状态推送（Host → 窗口） ──
+bridge.onState(function (s) {
+  if (!s || !alive) return;
+  state.enabled = !!s.enabled;
+  state.scale = typeof s.scale === 'number' && s.scale > 0 ? s.scale : 1;
+  state.skin = typeof s.skin === 'string' ? s.skin : 'default';
+  state.skins = Array.isArray(s.skins) ? s.skins : [];
+  if (typeof s.ts === 'number' && s.ts !== lastTs) {
+    lastTs = s.ts;
+    view.anim = typeof s.state === 'string' ? s.state : 'idle';
+    view.frame = 0;
+    showBubble(typeof s.message === 'string' ? s.message : '', view.anim);
+  }
+  if (state.skin !== lastSkin) applySkin();
+  if (state.scale !== lastScale) { lastScale = state.scale; if (loaded) sizeSprite(); }
+});
+
+// ── 点击穿透：鼠标悬停宠物区域时通知 Host 关闭穿透（可交互），离开则恢复穿透 ──
+var interactive = false;
+function checkInteractive() {
+  var r = pet.getBoundingClientRect();
+  var hit = (e_x >= r.left - PAD && e_x <= r.right + PAD && e_y >= r.top - 8 && e_y <= r.bottom + PAD);
+  if (hit !== interactive) {
+    interactive = hit;
+    if (bridge) bridge.action({ type: 'interactive', value: hit });
+  }
+}
+var e_x = 0, e_y = 0;
+document.addEventListener('mousemove', function (e) {
+  e_x = e.clientX; e_y = e.clientY;
+  if (!dragging) checkInteractive(); // 拖动时鼠标必在宠物上，跳过每帧重排（getBoundingClientRect）
+});
+
+// ── 拖动 / 双击（绑定整个窗口，方便按住任意处拖动） ──
+var dragging = false, moved = false, sx = 0, sy = 0, lastX = 0;
+var lastClickTs = 0, clickTimer = null;
+// 拖动 IPC 用 requestAnimationFrame 合并到 ~60fps：mousemove 频率可达 144Hz，
+// 直接每帧发 IPC + setPosition 会让透明窗口拖不动；rAF 由浏览器 vsync 调度，准确且不阻塞。
+var moveRAF = 0, pendingX = 0, pendingY = 0;
+function flushMove() {
+  moveRAF = 0;
+  if (bridge) bridge.draggingMove(pendingX, pendingY);
+}
+document.addEventListener('mousedown', function (e) {
+  if (e.button !== 0) return;
+  dragging = true; moved = false;
+  sx = e.screenX; sy = e.screenY;
+  lastX = e.screenX;
+  view.dragAnim = null;
+  pet.classList.add('grabbing');
+  document.body.classList.add('dsh-pet-dragging');
+  if (bridge) bridge.dragging(true, e.screenX, e.screenY);
+  e.preventDefault();
+});
+window.addEventListener('mousemove', function (e) {
+  if (!dragging) return;
+  var dx = e.screenX - sx, dy = e.screenY - sy;
+  if (Math.abs(dx) + Math.abs(dy) > 5) moved = true;
+  pendingX = e.screenX; pendingY = e.screenY;
+  if (!moveRAF) moveRAF = window.requestAnimationFrame(flushMove); // 每帧最多发一次 IPC
+  if (moved) {
+    // 用「本次移动增量」判断方向（对比上一次鼠标位置），
+    // 而不是从按下点累计——中途反方向拖能立即切换动画
+    var ddx = e.screenX - lastX;
+    view.dragAnim = Math.abs(ddx) > 1 ? (ddx > 0 ? 'run_r' : 'run_l') : (Math.abs(dx) > 4 ? (dx > 0 ? 'run_r' : 'run_l') : 'idle');
+    lastX = e.screenX;
+  }
+});
+window.addEventListener('mouseup', function () {
+  if (!dragging) return;
+  dragging = false;
+  if (moveRAF) { window.cancelAnimationFrame(moveRAF); moveRAF = 0; }
+  pet.classList.remove('grabbing');
+  document.body.classList.remove('dsh-pet-dragging');
+  if (bridge) bridge.dragging(false);
+  if (moved) {
+    view.dragAnim = null; view.anim = 'idle'; view.frame = 0;
+  } else {
+    // 双击才回 DSH（单击不动作，避免误触）
+    var now = Date.now();
+    if (now - lastClickTs < 400) {
+      // 双击：回 DSH + 挥手
+      lastClickTs = 0;
+      if (clickTimer) { window.clearTimeout(clickTimer); clickTimer = null; }
+      if (bridge) bridge.click();
+      view.anim = 'wave'; view.frame = 0;
+      showBubble('回到 DSH 界面！', 'wave');
+      window.setTimeout(function () { if (view.anim === 'wave') view.anim = 'idle'; }, 1500);
+    } else {
+      lastClickTs = now;
+      if (clickTimer) { window.clearTimeout(clickTimer); clickTimer = null; }
+      clickTimer = window.setTimeout(function () { lastClickTs = 0; clickTimer = null; }, 400);
+    }
+  }
+});
+
+// ── 右键：弹原生系统菜单（由 Host 用 Electron Menu.popup 弹出，不受窗口尺寸限制、点外部自动关闭） ──
+document.addEventListener('contextmenu', function (e) {
+  e.preventDefault();
+  if (bridge) bridge.action({ type: 'menu', x: e.screenX, y: e.screenY });
+});
+</script>
+</body>
+</html>

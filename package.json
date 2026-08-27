@@ -1,0 +1,50 @@
+{
+  "name": "dsh-pet",
+  "version": "0.0.1",
+  "description": "DSH 桌面宠物：跟随 agent 状态动画 + 气泡 + 拖动行走 + 权限提醒 + 任务完成提示 + 点击回 DSH",
+  "private": true,
+  "type": "module",
+  "main": "./lib/pet.js",
+  "types": "./lib/types/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "BSD-3-Clause",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc <2",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
+    "cordis": ">=4.0.0-rc <5",
+    "schemastery": "^3.18.0",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.0.1-rc <2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.0",
+    "tsdown": "^0.22.14"
+  },
+  "scripts": {
+    "build": "node scripts/make-client.js && node --check lib/index.js && node --check lib/client.js",
+    "typecheck": "echo '手写产物形态：src/*.ts 为参考实现，实际运行 lib/*.js（无构建链）'",
+    "build:client": "node scripts/make-client.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/pet.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}

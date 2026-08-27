@@ -1,0 +1,11 @@
+# 依赖与构建产物
+node_modules/
+*.tsbuildinfo
+*.tgz
+
+# 本地运行痕迹
+*.log
+.DS_Store
+Thumbs.db
+
+# 保留 lib/（正式入口 pet.js + 生成产物 pet-window.html/client.js 一起提交，开箱即用）
